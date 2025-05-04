@@ -5,87 +5,92 @@ from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 import json
 
-# Constants
-LAT = '51.5074'
-LON = '-0.1278'
+# Airflow connection IDs
 HTTP_CONN_ID = 'open_meteo_api'
 DB_CONN_ID = 'postgres_default'
 
-# Default DAG arguments
-args = {
+# List of locations to iterate (simulate hover effect)
+LOCATIONS = [
+    {"city": "London", "lat": "51.5074", "lon": "-0.1278"},
+    {"city": "New York", "lat": "40.7128", "lon": "-74.0060"},
+    {"city": "Tokyo", "lat": "35.6895", "lon": "139.6917"}
+]
+
+# DAG arguments
+default_args = {
     'owner': 'airflow',
     'start_date': days_ago(1)
 }
 
-# DAG definition
 with DAG(
-    dag_id='daily_weather_etl',
-    default_args=args,
+    dag_id='multi_city_weather_etl',
+    default_args=default_args,
     schedule_interval='@daily',
     catchup=False,
-    description='ETL pipeline to fetch, process, and store weather data for London'
+    description='Extract and store weather data for multiple cities sequentially'
 ) as dag:
 
     @task()
-    def fetch_weather():
-        """Fetch current weather information from Open-Meteo API."""
+    def fetch_weather_data(location):
+        """Fetch weather info for one city."""
         hook = HttpHook(http_conn_id=HTTP_CONN_ID, method='GET')
-        api_path = f'/v1/forecast?latitude={LAT}&longitude={LON}&current_weather=true'
-        response = hook.run(api_path)
+        endpoint = f"/v1/forecast?latitude={location['lat']}&longitude={location['lon']}&current_weather=true"
+        response = hook.run(endpoint)
 
         if response.status_code == 200:
-            return json.loads(response.text)
+            data = json.loads(response.text)
+            data['city'] = location['city']  # attach city name
+            return data
         else:
-            raise RuntimeError(f"API request failed with status code {response.status_code}")
+            raise Exception(f"Failed to get weather for {location['city']}")
 
     @task()
-    def process_weather(data):
-        """Process JSON weather data into a structured format."""
-        current = data.get("current_weather", {})
+    def transform_data(raw):
+        """Extract needed weather fields from raw data."""
+        current = raw['current_weather']
         return {
-            'lat': LAT,
-            'lon': LON,
-            'temp': current.get('temperature'),
-            'wind_speed': current.get('windspeed'),
-            'wind_dir': current.get('winddirection'),
-            'weather_code': current.get('weathercode')
+            'city': raw['city'],
+            'lat': raw['latitude'],
+            'lon': raw['longitude'],
+            'temp': current['temperature'],
+            'wind_speed': current['windspeed'],
+            'wind_dir': current['winddirection'],
+            'weather_code': current['weathercode']
         }
 
     @task()
-    def store_weather(record):
-        """Store the processed weather data into PostgreSQL."""
-        db = PostgresHook(postgres_conn_id=DB_CONN_ID)
-        conn = db.get_conn()
-        cur = conn.cursor()
+    def store_to_db(record):
+        """Insert weather data into PostgreSQL."""
+        hook = PostgresHook(postgres_conn_id=DB_CONN_ID)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS weather_info (
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS city_weather (
+                city TEXT,
                 lat FLOAT,
                 lon FLOAT,
                 temp FLOAT,
                 wind_speed FLOAT,
                 wind_dir FLOAT,
-                weather_code INTEGER,
-                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                weather_code INT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
-        cur.execute("""
-            INSERT INTO weather_info (lat, lon, temp, wind_speed, wind_dir, weather_code)
-            VALUES (%s, %s, %s, %s, %s, %s)
+        cursor.execute("""
+            INSERT INTO city_weather (city, lat, lon, temp, wind_speed, wind_dir, weather_code)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
-            record['lat'],
-            record['lon'],
-            record['temp'],
-            record['wind_speed'],
-            record['wind_dir'],
-            record['weather_code']
+            record['city'], record['lat'], record['lon'], record['temp'],
+            record['wind_speed'], record['wind_dir'], record['weather_code']
         ))
 
         conn.commit()
-        cur.close()
+        cursor.close()
 
-    # Define task dependencies
-    raw_data = fetch_weather()
-    structured_data = process_weather(raw_data)
-    store_weather(structured_data)
+    # Dynamically create task chains per location
+    for loc in LOCATIONS:
+        raw = fetch_weather_data(loc)
+        processed = transform_data(raw)
+        store_to_db(processed)
