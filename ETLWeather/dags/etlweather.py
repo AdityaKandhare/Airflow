@@ -1,9 +1,11 @@
 from airflow import DAG
 from airflow.decorators import task
-from airflow.utils.dates import days_ago
+import pendulum
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 import json
+from datetime import datetime
+
 
 # Airflow connection IDs
 HTTP_CONN_ID = 'open_meteo_api'
@@ -19,16 +21,19 @@ LOCATIONS = [
 # DAG arguments
 default_args = {
     'owner': 'airflow',
-    'start_date': days_ago(1)
+    'start_date': pendulum.now().subtract(days=1)
+
 }
 
 with DAG(
-    dag_id='multi_city_weather_etl',
+    "etlweather",
     default_args=default_args,
-    schedule_interval='@daily',
+    description="Weather ETL DAG",
+    schedule="@daily",  # <- updated here
+    start_date=datetime(2024, 1, 1),
     catchup=False,
-    description='Extract and store weather data for multiple cities sequentially'
 ) as dag:
+
 
     @task()
     def fetch_weather_data(location):
@@ -60,7 +65,7 @@ with DAG(
 
     @task()
     def store_to_db(record):
-        """Insert weather data into PostgreSQL."""
+        """Insert weather data using PostgresHook (Airflow-managed creds)."""
         hook = PostgresHook(postgres_conn_id=DB_CONN_ID)
         conn = hook.get_conn()
         cursor = conn.cursor()
@@ -88,6 +93,8 @@ with DAG(
 
         conn.commit()
         cursor.close()
+        conn.close()
+
 
     # Dynamically create task chains per location
     for loc in LOCATIONS:
